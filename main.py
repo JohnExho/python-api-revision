@@ -18,9 +18,9 @@ import pickle
 app = FastAPI()
 
 # --- MySQL config ---
-MYSQL_HOST = "127.0.0.1"
-MYSQL_USER = "root"
-MYSQL_PASSWORD = ""
+MYSQL_HOST = "180.191.23.206"
+MYSQL_USER = "webuser"
+MYSQL_PASSWORD = "strongpassword"
 MYSQL_DB = "dayao"
 
 def get_mysql_connection():
