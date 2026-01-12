@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+mysql-connector-python
+scikit-learn
+numpy
+pandas
+statsmodels
+joblib
+tensorflow
