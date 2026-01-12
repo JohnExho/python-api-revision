@@ -21,7 +21,7 @@ app = FastAPI()
 MYSQL_HOST = "180.191.23.206"
 MYSQL_USER = "webuser"
 MYSQL_PASSWORD = "strongpassword"
-MYSQL_DB = "dayao"
+MYSQL_DB = "Dayao"
 
 def get_mysql_connection():
     return mysql.connector.connect(
