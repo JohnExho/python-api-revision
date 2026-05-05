@@ -8,7 +8,7 @@ import pandas as pd
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import joblib
 import os
-from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score, accuracy_score, precision_score, recall_score, f1_score, cohen_kappa_score
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -18,10 +18,52 @@ import pickle
 app = FastAPI()
 
 # --- MySQL config ---
-MYSQL_HOST = "180.191.23.206"
-MYSQL_USER = "webuser"
-MYSQL_PASSWORD = "strongpassword"
+MYSQL_HOST = "localhost"
+MYSQL_USER = "root"
+MYSQL_PASSWORD = ""
 MYSQL_DB = "Dayao"
+
+def calculate_classification_metrics(y_true, y_pred):
+    """Convert regression predictions to binary classification and calculate metrics"""
+    try:
+        y_true = np.asarray(y_true).flatten()
+        y_pred = np.asarray(y_pred).flatten()
+        
+        if len(y_true) == 0 or len(y_pred) == 0:
+            return {
+                "accuracy": None,
+                "precision": None,
+                "recall": None,
+                "f1_score": None,
+                "kappa": None
+            }
+        
+        # Use median as threshold
+        threshold = np.median(y_true)
+        y_true_binary = (y_true > threshold).astype(int)
+        y_pred_binary = (y_pred > threshold).astype(int)
+        
+        accuracy = round(float(accuracy_score(y_true_binary, y_pred_binary)), 4)
+        precision = round(float(precision_score(y_true_binary, y_pred_binary, zero_division=0)), 4)
+        recall = round(float(recall_score(y_true_binary, y_pred_binary, zero_division=0)), 4)
+        f1 = round(float(f1_score(y_true_binary, y_pred_binary, zero_division=0)), 4)
+        kappa = round(float(cohen_kappa_score(y_true_binary, y_pred_binary)), 4)
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "kappa": kappa
+        }
+    except Exception as e:
+        print(f"⚠ Classification metrics error: {e}")
+        return {
+            "accuracy": None,
+            "precision": None,
+            "recall": None,
+            "f1_score": None,
+            "kappa": None
+        }
 
 def get_mysql_connection():
     return mysql.connector.connect(
@@ -149,6 +191,24 @@ def forecast_location():
     conn = get_mysql_connection()
     cursor = conn.cursor(dictionary=True)
 
+    if location_rows is None or len(location_rows) == 0:
+        print("⚠ No location_rows available")
+        conn.close()
+        return {
+            "clusters": [],
+            "forecast_metrics": {
+                "MAPE": None,
+                "RMSE": None,
+                "R2": None,
+                "model_status": "no_data",
+                "accuracy": None,
+                "precision": None,
+                "recall": None,
+                "f1_score": None,
+                "kappa": None
+            }
+        }
+
     for idx, row in enumerate(location_rows):
         province_id = row["province_id"]
         city_id = row["city_id"]
@@ -170,7 +230,7 @@ def forecast_location():
         daily_series = np.array([
             day_map.get((today - timedelta(days=29-i)).strftime('%Y-%m-%d'), 0) 
             for i in range(30)
-        ])
+        ], dtype=float)
 
         # Linear regression forecast (fast, always fresh)
         X = np.arange(len(daily_series)).reshape(-1, 1)
@@ -179,6 +239,11 @@ def forecast_location():
         model.fit(X, y)
         future_X = np.arange(len(daily_series), len(daily_series)+7).reshape(-1, 1)
         forecast_values = [max(0, int(round(val))) for val in model.predict(future_X)]
+
+        # Collect predictions for metrics
+        predictions = model.predict(X).flatten()
+        actuals_all.extend(y)
+        predicted_all.extend(predictions)
 
         distance = float(np.linalg.norm([sum(y)] - centroids[cluster_id]))
         variance = cluster_variances[cluster_id] or 0.0001
@@ -201,19 +266,43 @@ def forecast_location():
             "forecast_next_7_days": forecast_dict
         })
 
-        actuals_all.extend(y)
-        predicted_all.extend(list(model.predict(X)))
-
     cursor.close()
     conn.close()
 
     # Calculate metrics
-    try:
-        mape = mean_absolute_percentage_error(actuals_all, predicted_all)
-        rmse = mean_squared_error(actuals_all, predicted_all, squared=False)
-        r2 = r2_score(actuals_all, predicted_all)
-    except:
-        mape = rmse = r2 = None
+    mape = rmse = r2 = None
+    classification_metrics = {
+        "accuracy": None,
+        "precision": None,
+        "recall": None,
+        "f1_score": None,
+        "kappa": None
+    }
+    
+    if len(actuals_all) > 1 and len(predicted_all) > 1:
+        try:
+            actuals_arr = np.array(actuals_all, dtype=float)
+            predicted_arr = np.array(predicted_all, dtype=float)
+            
+            print(f"📊 Location metrics calculated on {len(actuals_arr)} data points")
+            
+            # MAPE with zero protection
+            mask = actuals_arr != 0
+            if np.sum(mask) > 0:
+                mape = round(float(mean_absolute_percentage_error(actuals_arr[mask], predicted_arr[mask])), 2)
+            
+            # RMSE - calculate manually
+            mse = mean_squared_error(actuals_arr, predicted_arr)
+            rmse = round(float(np.sqrt(mse)), 2)
+            r2 = round(float(r2_score(actuals_arr, predicted_arr)), 4)
+            classification_metrics = calculate_classification_metrics(actuals_arr, predicted_arr)
+        except Exception as e:
+            print(f"⚠ Location metrics error: {e}")
+            import traceback
+            traceback.print_exc()
+            mape = rmse = r2 = None
+    else:
+        print(f"⚠ Insufficient data for metrics: actuals={len(actuals_all)}, predicted={len(predicted_all)}")
 
     return {
         "clusters": results, 
@@ -221,7 +310,8 @@ def forecast_location():
             "MAPE": mape, 
             "RMSE": rmse, 
             "R2": r2,
-            "model_status": "retrained" if total_rows != last_training_count else "cached"
+            "model_status": "retrained" if total_rows != last_training_count else "cached",
+            **classification_metrics
         }
     }
 
@@ -358,6 +448,8 @@ def forecast_waitlist(clinic_id: str = None):
         rmse = float(np.sqrt(np.mean((series - predicted)**2)))
         r2 = 0.0
     
+    classification_metrics = calculate_classification_metrics(series, predicted)
+    
     forecast_dict = {
         (today + timedelta(days=i+1)).strftime("%Y-%m-%d"): forecast_values[i] 
         for i in range(7)
@@ -376,7 +468,8 @@ def forecast_waitlist(clinic_id: str = None):
             "trend_slope": round(trend_slope, 4),
             "forecast_method": "moving_average_with_dow_pattern",
             "clinic_id": clinic_id if clinic_id else "all",
-            "model_status": "trained_fresh"
+            "model_status": "trained_fresh",
+            **classification_metrics
         }, 
         "forecast_next_7_days": forecast_dict,
         "data_quality": {
@@ -430,26 +523,22 @@ def forecast_revenue(clinic_id: str = None):
     
     all_days = pd.date_range(df.index.min(), df.index.max(), freq='D')
     df = df.reindex(all_days, fill_value=0.0)
-    series = df['daily_revenue'].values.astype(float)
+    series = df['daily_revenue'].astype(float).values
     
     today = datetime.today()
     
-    if len(series) < 7:
+    if len(series) < 14:
         avg_val = float(np.mean(series))
         forecast_dict = {
             (today + timedelta(days=i+1)).strftime("%Y-%m-%d"): round(avg_val, 2)
             for i in range(7)
         }
         return {
-            "forecast_metrics": {"note": "Insufficient data"},
+            "forecast_metrics": {"note": "Insufficient data for modeling"},
             "forecast_next_7_days": forecast_dict
         }
     
-    # Zero-inflation handling
-    non_zero_mask = series > 0
-    series_non_zero = series[non_zero_mask]
-    
-    if len(series_non_zero) == 0:
+    if np.all(series == 0):
         forecast_dict = {
             (today + timedelta(days=i+1)).strftime("%Y-%m-%d"): 0.0
             for i in range(7)
@@ -459,67 +548,68 @@ def forecast_revenue(clinic_id: str = None):
             "forecast_next_7_days": forecast_dict
         }
     
-    # Log-transform for spike reduction
-    series_log = np.log1p(series_non_zero)
-    
-    # Linear trend on log-transformed data
-    X = np.arange(len(series_non_zero)).reshape(-1, 1)
+    # Log-transform for spike reduction, keep zeros
+    series_log = np.log1p(series)
+    X = np.arange(len(series_log)).reshape(-1, 1)
     ltm_model = LinearRegression()
     ltm_model.fit(X, series_log)
-    
     trend_slope = float(ltm_model.coef_[0])
     
-    # Exponential smoothing
-    if len(series_non_zero) >= 14:
+    if len(series_log) >= 21:
         try:
             exp_model = ExponentialSmoothing(
-                series_non_zero, 
-                trend="add", 
-                seasonal="add", 
-                seasonal_periods=7
+                series_log,
+                trend="add",
+                seasonal="add",
+                seasonal_periods=7,
+                initialization_method="estimated"
             )
-            exp_fit = exp_model.fit()
-            exp_forecast = exp_fit.forecast(7)
-        except:
-            exp_forecast = np.full(7, series_non_zero[-1])
+            exp_fit = exp_model.fit(optimized=True)
+            exp_fitted_log = exp_fit.fittedvalues
+            exp_forecast_log = exp_fit.forecast(7)
+        except Exception as e:
+            print(f"⚠ Revenue smoothing fallback: {e}")
+            exp_fitted_log = np.full_like(series_log, np.mean(series_log))
+            exp_forecast_log = np.full(7, np.mean(series_log))
     else:
-        exp_forecast = np.full(7, series_non_zero[-1])
+        exp_fitted_log = np.full_like(series_log, np.mean(series_log))
+        exp_forecast_log = np.full(7, np.mean(series_log))
     
-    # Day-of-week multipliers
+    # Day-of-week multipliers using original scale
     df_dow = pd.DataFrame({
         'revenue': series,
         'dow': [(df.index.min() + timedelta(days=i)).weekday() for i in range(len(series))]
     })
-    
-    mean_val = float(series_non_zero.mean())
+    mean_val = float(series.mean())
     dow_multipliers = {}
     for dow in range(7):
         dow_vals = df_dow[df_dow['dow'] == dow]['revenue']
-        if len(dow_vals) > 0:
-            dow_avg = float(dow_vals.mean())
-            dow_multipliers[dow] = float(dow_avg / mean_val) if mean_val > 0 else 1.0
+        if len(dow_vals) > 0 and mean_val > 0:
+            dow_multipliers[dow] = float(dow_vals.mean() / mean_val)
         else:
             dow_multipliers[dow] = 1.0
     
     # Generate forecast
+    base_forecast_log = 0.5 * (ltm_model.predict(np.arange(len(series_log), len(series_log) + 7).reshape(-1, 1)) + exp_forecast_log)
     forecast_values = []
     for i in range(7):
-        future_x = len(series_non_zero) + i + 1
-        ltm_pred_log = ltm_model.predict(np.array([[future_x]]))[0]
-        ltm_pred = np.expm1(ltm_pred_log)
-        
-        base_forecast = 0.5 * ltm_pred + 0.5 * exp_forecast[i]
-        
+        forecast = np.expm1(base_forecast_log[i])
         future_dow = (today + timedelta(days=i+1)).weekday()
-        forecast = base_forecast * dow_multipliers.get(future_dow, 1.0)
-        
-        forecast_values.append(round(max(0, forecast), 2))
+        forecast *= dow_multipliers.get(future_dow, 1.0)
+        forecast_values.append(round(max(0.0, forecast), 2))
     
-    # Metrics
-    ltm_pred_series = np.expm1(ltm_model.predict(X))
-    mape = float(np.mean(np.abs((series_non_zero - ltm_pred_series) / (series_non_zero + 0.01))) * 100)
-    rmse = float(np.sqrt(np.mean((series_non_zero - ltm_pred_series)**2)))
-    r2 = float(r2_score(series_non_zero, ltm_pred_series))
+    # In-sample fitted values for metrics
+    in_sample_log = 0.5 * (ltm_model.predict(X) + exp_fitted_log)
+    fitted = np.expm1(in_sample_log)
+    
+    mask = series > 0
+    if np.sum(mask) > 0:
+        mape = round(float(mean_absolute_percentage_error(series[mask], fitted[mask])) * 100, 2)
+    else:
+        mape = None
+    rmse = round(float(np.sqrt(mean_squared_error(series, fitted))), 2)
+    r2 = round(float(r2_score(series, fitted)), 4)
+    classification_metrics = calculate_classification_metrics(series, fitted)
     
     forecast_dict = {
         (today + timedelta(days=i+1)).strftime("%Y-%m-%d"): forecast_values[i]
@@ -528,9 +618,9 @@ def forecast_revenue(clinic_id: str = None):
     
     return {
         "forecast_metrics": {
-            "MAPE": round(mape, 2),
-            "RMSE": round(rmse, 2),
-            "R2": round(r2, 4),
+            "MAPE": mape,
+            "RMSE": rmse,
+            "R2": r2,
             "data_points": len(series),
             "non_zero_days": int(np.count_nonzero(series)),
             "mean_daily": round(mean_val, 2),
@@ -538,12 +628,13 @@ def forecast_revenue(clinic_id: str = None):
             "total_forecast_7d": round(sum(forecast_values), 2),
             "forecast_method": "log_exp_smoothing_dow",
             "clinic_id": clinic_id if clinic_id else "all",
-            "model_status": "trained_fresh"
+            "model_status": "trained_fresh",
+            **classification_metrics
         },
         "forecast_next_7_days": forecast_dict,
         "data_quality": {
             "status": "good" if np.std(series) / mean_val < 1.5 else "moderate",
-            "recommendation": "Data suitable for forecasting" if np.count_nonzero(series)/len(series) > 0.6 else "Consider more consistent revenue data",
+            "recommendation": "Data suitable for forecasting" if np.count_nonzero(series) / len(series) > 0.6 else "Consider more consistent revenue data",
             "trend_direction": "increasing" if trend_slope > 0 else "decreasing" if trend_slope < 0 else "stable"
         }
     }
@@ -640,6 +731,7 @@ def train_cnn_treatment():
 
     df = pd.DataFrame(rows)
     df['day'] = pd.to_datetime(df['day'])
+    df['daily_count'] = df['daily_count'].astype(float)
     treatment_names[:] = df['treatment_name'].unique().tolist()
 
     # Build daily matrix across entire date range
@@ -647,7 +739,9 @@ def train_cnn_treatment():
     matrix = []
     for t in treatment_names:
         t_df = df[df['treatment_name'] == t].set_index('day')
-        series = t_df.reindex(date_range, fill_value=0)['daily_count'].values
+        series = pd.Series(index=date_range, dtype=float)
+        series.update(t_df['daily_count'])
+        series = series.fillna(0.0).values
         matrix.append(series)
     matrix = np.array(matrix).T
 
@@ -759,12 +853,15 @@ def forecast_treatment(clinic_id: str = None):
     # Prepare 30-day input matrix
     df_30 = pd.DataFrame(rows_30)
     df_30['day'] = pd.to_datetime(df_30['day'])
+    df_30['daily_count'] = df_30['daily_count'].astype(float)
     date_range_30 = pd.date_range(end=datetime.today(), periods=30)
     
     matrix_30 = []
     for t in treatment_names:
         t_df = df_30[df_30['treatment_name'] == t].set_index('day')
-        series = t_df.reindex(date_range_30, fill_value=0)['daily_count'].values
+        series = pd.Series(index=date_range_30, dtype=float)
+        series.update(t_df['daily_count'])
+        series = series.fillna(0.0).values
         matrix_30.append(series)
     matrix_30 = np.array(matrix_30).T
     
@@ -812,13 +909,16 @@ def forecast_treatment(clinic_id: str = None):
     if rows_all and len(rows_all) >= 40:
         df_all = pd.DataFrame(rows_all)
         df_all['day'] = pd.to_datetime(df_all['day'])
+        df_all['daily_count'] = df_all['daily_count'].astype(float)
         date_range_all = pd.date_range(df_all['day'].min(), df_all['day'].max())
         
         # Build full historical matrix
         matrix_all = []
         for t in treatment_names:
             t_df = df_all[df_all['treatment_name'] == t].set_index('day')
-            series = t_df.reindex(date_range_all, fill_value=0)['daily_count'].values
+            series = pd.Series(index=date_range_all, dtype=float)
+            series.update(t_df['daily_count'])
+            series = series.fillna(0.0).values
             matrix_all.append(series)
         matrix_all = np.array(matrix_all).T
         
@@ -856,6 +956,24 @@ def forecast_treatment(clinic_id: str = None):
         t: round(sum([f["predictions"][t] for f in forecast_results]), 2)
         for t in treatment_names
     }
+    
+    # Calculate classification metrics on validation data
+    classification_metrics = {
+        "accuracy": None,
+        "precision": None,
+        "recall": None,
+        "f1_score": None,
+        "kappa": None
+    }
+    
+    if 'y_val_denorm' in locals() and 'y_pred_denorm' in locals() and len(y_val_denorm) > 0:
+        try:
+            # Flatten predictions and actuals
+            y_true_flat = y_val_denorm.flatten()
+            y_pred_flat = y_pred_denorm.flatten()
+            classification_metrics = calculate_classification_metrics(y_true_flat, y_pred_flat)
+        except Exception as e:
+            classification_metrics["error"] = str(e)
 
     return {
         "forecast_metrics": {
@@ -867,7 +985,8 @@ def forecast_treatment(clinic_id: str = None):
             "validation_days": validation_days,
             "validation_sequences": len(X_val) if 'X_val' in locals() and len(X_val) > 0 else 0,
             "model_status": retrain_status,
-            "clinic_id": clinic_id if clinic_id else "all"
+            "clinic_id": clinic_id if clinic_id else "all",
+            **classification_metrics
         },
         "forecast_next_7_days": forecast_results,
         "treatment_totals_7d": totals,
@@ -881,17 +1000,17 @@ def root():
         "service": "AI Forecast API",
         "version": "2.1",
         "endpoints": {
-            "/forecastlocation": "Location demand (KMeans clustering - cached)",
-            "/forecastwaitlist": "Waitlist prediction (Moving avg - fresh)",
-            "/forecastrevenue": "Revenue prediction (Exp smoothing - fresh)",
-            "/forecasttreatment": "Treatment prediction (CNN - cached)",
+            "/forecastlocation": "Location demand (KMeans clustering + linear regression, cached)",
+            "/forecastwaitlist": "Waitlist prediction (moving average + DOW pattern, fresh)",
+            "/forecastrevenue": "Revenue prediction (log-trend + exponential smoothing + DOW, fresh)",
+            "/forecasttreatment": "Treatment prediction (CNN on historical treatments, cached)",
             "/train/location": "Manually retrain location model",
             "/train/treatment": "Manually retrain treatment model"
         },
         "strategy": {
-            "location": "Cached KMeans model, auto-retrains on new data",
-            "waitlist": "Fresh training every request (fast algorithms)",
-            "revenue": "Fresh training every request (fast algorithms)",
-            "treatment": "Cached CNN model, auto-retrains on new data"
+            "location": "Cached KMeans clustering model with fresh linear regression forecasts",
+            "waitlist": "Fresh moving-average forecast with daily seasonality",
+            "revenue": "Fresh log-trend + exponential smoothing forecast with DOW adjustments",
+            "treatment": "Cached CNN model that retrains when new completed treatments arrive"
         }
     }
